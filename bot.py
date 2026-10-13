@@ -178,7 +178,7 @@ def collect():
                 if not links: raise RuntimeError('Нет доступных ссылок')
                 parsed_count = 0
                 detail_errors = 0
-                for url in links:
+                for link_index, url in enumerate(links):
                     if url in found: continue
                     if urlsplit(url).hostname != urlsplit(source['url']).hostname: continue
                     try:
@@ -191,6 +191,12 @@ def collect():
                         try: page.wait_for_selector('script[type="application/ld+json"]', state='attached', timeout=5000)
                         except Exception: pass
                         scripts = page.locator('script[type="application/ld+json"]').all_text_contents()
+                        if link_index < 2:
+                            print('DIAGNOSTIC URL:', url)
+                            print('DIAGNOSTIC TITLE:', page.title())
+                            print('DIAGNOSTIC H1:', page.locator('h1').all_text_contents())
+                            print('DIAGNOSTIC JSON-LD:', len(scripts))
+                            print('DIAGNOSTIC TEXT:', page.locator('body').inner_text()[:5000])
                         page_jobs = []
                         for script in scripts:
                             try: data = json.loads(script)
