@@ -61,13 +61,16 @@ def read_job(markup,url):
     def prop(key):
         n=next((n for n in nodes if n.attrs.get('itemprop')==key),None)
         return (n.attrs.get('content') or n.text()).strip() if n else ''
+    def location():
+        pieces=[prop(k) for k in ('addressLocality','streetAddress','addressRegion') if prop(k)]
+        return ', '.join(pieces) if pieces else prop('jobLocation')
     if 'happymonday' in url:
         title=prop('title') or (h.text().strip() if h else '')
         org=next((n for n in nodes if n.attrs.get('itemprop')=='hiringOrganization'),None)
         company=next((n.text().strip() for n in org.walk() if n.attrs.get('itemprop')=='name'),'Компания требует проверки') if org else 'Компания требует проверки'
         return {'title':title,'description':prop('description'),'datePosted':prop('datePosted'),
           'validThrough':prop('validThrough'),'hiringOrganization':{'name':company},
-          'jobLocation':{'address':{'streetAddress':prop('jobLocation')}},'url':canonical(url)}
+          'jobLocation':{'address':{'streetAddress':location()}},'url':canonical(url)}
     if 'jobs.dou.ua' in url:
         title=h.text().strip() if h else ''
         desc=next((n.text() for n in nodes if 'vacancy-section' in n.attrs.get('class','')), '')

@@ -19,9 +19,22 @@ LEFT = r'лівобереж|левобереж|дарницьк|дарницк|�
 RIGHT = r'подільськ|подольск|оболон|голосіїв|голосеев|печерськ|печерск|солом.ян|святошин|шевченківськ|шевченковск|кирилівськ|кирилловск|електриків|электриков|жилянськ|жилянск|деміїв|демиев|васильків|васильков|контрактов|героїв дніпра|героев днепра'
 ROLE = r'аналітик|аналитик|data\s*analyst|sales\s*analyst|research\s*analyst'
 EXCLUDE = r'business\s*analyst|бізнес.аналітик|бизнес.аналитик|системн\w*.аналітик|системн\w*.аналитик|senior|lead\s*data|керівник|руководитель|хімік|химик|військова служба|військовослужбовець'
+EXCLUDE += r'|кібер|кибер|cyber|\bsoc\b|інформаційної безпеки|информационной безопасности'
+RIGHT += r'|золоті ворота|золотые ворота|бульваро.кудрявськ|бульварно.кудрявск'
 
 def text_only(value):
-    return html.unescape(re.sub(r'<[^>]+>', ' ', str(value or '')))
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', str(value or '')))).strip()
+
+def clean_address(value):
+    value=text_only(value)
+    # Some sites put the entire job header in streetAddress; retain only
+    # the published city instead of treating employer/skills as an address.
+    if len(value)>300 or re.search(r'Рівень англійської|Повна зайнятість|junior.*middle|Intermediate.*B[12]|Англійська необов',value,re.I):
+        city=re.search(r'Київ|Киев|Kyiv|Kiev',value,re.I)
+        return city[0] if city else 'адрес не опубликован'
+    value=re.sub(r'(Київ|Киев|Kyiv)(?=[А-ЯІЇЄҐа-яіїєґA-Za-z])',r'\1, ',value)
+    value=re.sub(r'(?<!\s)(р-н\.|метро)',r', \1 ',value)
+    return re.sub(r'\s+', ' ',value).strip()
 
 def postings(value):
     if isinstance(value, list):
@@ -43,7 +56,7 @@ def locations(job):
         if isinstance(a, dict):
             parts.append(', '.join(str(a[k]) for k in ['addressLocality', 'streetAddress', 'addressRegion'] if a.get(k)))
         elif isinstance(a, str): parts.append(a)
-    return '; '.join(parts)
+    return clean_address('; '.join(parts))
 
 def visible_posting(title, body, page_title, url, now=None):
     """Conservative fallback; never infer a fresh date from today's date."""
@@ -147,7 +160,8 @@ def assess(job):
             if dt.date.fromisoformat(str(expiry)[:10]) < dt.datetime.now(ZoneInfo('Europe/Kyiv')).date(): return None
         except ValueError: pass
     if age <= 7: score += 1
-    employer = job.get('hiringOrganization', {}).get('name', 'Компания не указана')
+    employer = text_only(job.get('hiringOrganization', {}).get('name', 'Компания не указана'))
+    title = text_only(title)
     salary = job.get('baseSalary')
     salary_text = job.get('_salary_text') or 'не указана'
     if isinstance(salary, dict):
