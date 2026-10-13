@@ -45,6 +45,27 @@ def locations(job):
         elif isinstance(a, str): parts.append(a)
     return '; '.join(parts)
 
+def visible_posting(title, body, page_title, url):
+    """Conservative fallback; never infer a fresh date from today's date."""
+    lines = [s.strip() for s in body.splitlines() if s.strip()]
+    months = {'січня':1,'января':1,'лютого':2,'февраля':2,'березня':3,'марта':3,
+      'квітня':4,'апреля':4,'травня':5,'мая':5,'червня':6,'июня':6,
+      'липня':7,'июля':7,'серпня':8,'августа':8,'вересня':9,'сентября':9,
+      'жовтня':10,'октября':10,'листопада':11,'ноября':11,'грудня':12,'декабря':12}
+    date = ''
+    header = '\n'.join(lines[:65])
+    match = re.search(r'\b(\d{1,2})\s+('+'|'.join(months)+r')\s+(20\d{2})\b',header,re.I)
+    if match:
+        try: date = dt.date(int(match[3]),months[match[2].lower()],int(match[1])).isoformat()
+        except ValueError: return None
+    if not date: return None
+    company = re.search(r'\s[-–]\s(.+?)\s*\|\s*(?:robota\.ua|Work\.ua)',page_title,re.I)
+    address = next((s for s in lines[:65] if re.match(r'^(Київ|Киев|Kyiv)\b',s,re.I)), '')
+    desc = re.split(r'Гарячі вакансії|Схожі вакансії|Похожие вакансии|Рекомендовані вакансії',body, maxsplit=1)[0]
+    return {'title':title,'description':desc,'url':url,'datePosted':date,
+      'hiringOrganization':{'name':company[1] if company else 'Компания требует проверки'},
+      'jobLocation':{'address':{'streetAddress':address}}, '_date_source':'дата в тексте страницы'}
+
 def assess(job):
     title = str(job.get('title', ''))
     desc = text_only(job.get('description', ''))
@@ -149,34 +170,49 @@ def collect():
         for source in sources:
             try:
                 response = page.goto(source['url'], wait_until='domcontentloaded', timeout=45000)
-                if response and response.status >= 400: raise RuntimeError('HTTP')
+                if response and response.status >= 400: raise RuntimeError('HTTP '+str(response.status))
                 try: page.wait_for_selector(source['selector'], timeout=12000)
                 except Exception: pass
                 links = page.locator(source['selector']).evaluate_all('(els) => els.map(e => e.href)')
                 links = list(dict.fromkeys(links))[:25]
                 if not links: raise RuntimeError('Нет доступных ссылок')
                 parsed_count = 0
+                detail_errors = 0
                 for url in links:
                     if url in found: continue
                     if urlsplit(url).hostname != urlsplit(source['url']).hostname: continue
                     try:
                         response = page.goto(url, wait_until='domcontentloaded', timeout=35000)
-                        if response and response.status >= 400: continue
+                        if response and response.status >= 400:
+                            detail_errors += 1
+                            continue
+                        try: page.wait_for_selector('h1', timeout=12000)
+                        except Exception: pass
                         try: page.wait_for_selector('script[type="application/ld+json"]', state='attached', timeout=5000)
                         except Exception: pass
                         scripts = page.locator('script[type="application/ld+json"]').all_text_contents()
+                        page_jobs = []
                         for script in scripts:
                             try: data = json.loads(script)
                             except ValueError: continue
-                            for job in postings(data):
+                            page_jobs.extend(postings(data))
+                        if not page_jobs and page.locator('h1').count():
+                            job = visible_posting(page.locator('h1').first.inner_text(),page.locator('body').inner_text(),page.title(),url)
+                            if job: page_jobs.append(job)
+                        for job in page_jobs:
                                 job['url'] = url
                                 parsed_count += 1
                                 result = assess(job)
                                 if result: found[url] = result
-                    except Exception: continue
-                if not parsed_count: errors.append(source['name'] + ': описания недоступны или формат сайта изменился')
-            except Exception:
-                errors.append(source['name'] + ': сбор недоступен (блокировка, сеть или формат сайта)')
+                    except Exception:
+                        detail_errors += 1
+                        continue
+                diagnostic = f"ссылок {len(links)}, описаний {parsed_count}, ошибок страниц {detail_errors}"
+                print(source['name']+': '+diagnostic)
+                if not parsed_count: errors.append(source['name'] + ': '+diagnostic+'; вакансии не прочитаны')
+            except Exception as error:
+                status = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+                errors.append(source['name'] + ': сбор недоступен; '+status)
         browser.close()
     return list(found.values()), errors
 
@@ -189,7 +225,7 @@ def report(jobs, errors, seen):
     pending.sort(key=rank, reverse=True)
     selected = main[:15]
     lines = ['Вакансии аналитика · '+today, 'Бесплатная оценка по правилам, без AI.',
-             'Дата из метаданных сайта; первая публикация/обновление не различены.']
+             'Дата с сайта (метаданные или текст); первая публикация/обновление не различены.']
     if selected and any(j['age'] > 7 for j in selected): lines.append('Поиск расширен до 14 дней.')
     def card(j, i):
         label = 'повтор из предыдущих отправок' if j['url'] in seen else 'впервые в отправках этого бота'
@@ -201,7 +237,7 @@ def report(jobs, errors, seen):
             '; '.join(k+': '+v for k,v in j['skills'].items()),
             'Соответствие: '+fit+'; '+('; '.join(j['gaps']) or 'основной плюс: навыки обработки данных'), j['url']])
     for i,j in enumerate(selected, 1): lines.append(card(j,i))
-    if not selected: lines.append('\nПодтверждённых подходящих вакансий в основном топе нет. Это не означает, что на рынке вакансий нет.')
+    if not selected: lines.append('\nСбор не дал подходящих вакансий. При ошибках источников результат поиска неполный; это не означает отсутствия вакансий.')
     if pending:
         lines.append('\nЛОКАЦИЯ ТРЕБУЕТ УТОЧНЕНИЯ — вне основного топа')
         for i,j in enumerate(pending[:5],1): lines.append(card(j,i))
