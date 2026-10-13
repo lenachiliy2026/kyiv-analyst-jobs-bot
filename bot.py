@@ -45,7 +45,7 @@ def locations(job):
         elif isinstance(a, str): parts.append(a)
     return '; '.join(parts)
 
-def visible_posting(title, body, page_title, url):
+def visible_posting(title, body, page_title, url, now=None):
     """Conservative fallback; never infer a fresh date from today's date."""
     lines = [s.strip() for s in body.splitlines() if s.strip()]
     months = {'січня':1,'января':1,'лютого':2,'февраля':2,'березня':3,'марта':3,
@@ -58,13 +58,35 @@ def visible_posting(title, body, page_title, url):
     if match:
         try: date = dt.date(int(match[3]),months[match[2].lower()],int(match[1])).isoformat()
         except ValueError: return None
+    date_source = 'дата в тексте сайта; значение не установлено'
+    if not date:
+        clock = now or dt.datetime.now(ZoneInfo('Europe/Kyiv'))
+        relative = re.search(r'\b(\d+)\s*(хвилин\w*|минут\w*|годин\w*|час\w*|дн\w*|день|тижн\w*|недел\w*)\s+(?:тому|назад)\b',header,re.I)
+        if relative:
+            number, unit = int(relative[1]), relative[2].lower()
+            if unit.startswith(('хвилин','минут')): delta = dt.timedelta(minutes=number)
+            elif unit.startswith(('годин','час')): delta = dt.timedelta(hours=number)
+            elif unit.startswith(('тижн','недел')): delta = dt.timedelta(weeks=number)
+            else: delta = dt.timedelta(days=number)
+            date = (clock-delta).date().isoformat()
+            date_source = 'приблизительная дата обновления: '+relative[0]
+        elif re.search(r'\b(?:сьогодні|сегодня)\b',header,re.I):
+            date = clock.date().isoformat()
+            date_source = 'обновление сегодня по тексту сайта'
+        elif re.search(r'\b(?:вчора|вчера)\b',header,re.I):
+            date = (clock-dt.timedelta(days=1)).date().isoformat()
+            date_source = 'обновление вчера по тексту сайта'
     if not date: return None
     company = re.search(r'\s[-–]\s(.+?)\s*\|\s*(?:robota\.ua|Work\.ua)',page_title,re.I)
-    address = next((s for s in lines[:65] if re.match(r'^(Київ|Киев|Kyiv)\b',s,re.I)), '')
+    city_index = next((i for i,s in enumerate(lines[:65]) if re.match(r'^(Київ|Киев|Kyiv)',s,re.I)), None)
+    address = lines[city_index] if city_index is not None else ''
+    employer = company[1] if company else (lines[city_index+1] if city_index is not None and city_index+1 < len(lines) else 'Компания требует проверки')
+    salary_line = next((s for s in lines[:city_index or 20] if re.search(r'\d.*(?:₴|грн)',s)), '')
     desc = re.split(r'Гарячі вакансії|Схожі вакансії|Похожие вакансии|Рекомендовані вакансії',body, maxsplit=1)[0]
     return {'title':title,'description':desc,'url':url,'datePosted':date,
-      'hiringOrganization':{'name':company[1] if company else 'Компания требует проверки'},
-      'jobLocation':{'address':{'streetAddress':address}}, '_date_source':'дата в тексте страницы'}
+      'hiringOrganization':{'name':employer},
+      'jobLocation':{'address':{'streetAddress':address}}, '_date_source':date_source,
+      '_salary_text':salary_line, '_format': 'гибрид' if re.search(r'гібрид|гибрид',header,re.I) else 'офис' if 'В офісі/на місці' in header else 'формат уточнить'}
 
 def assess(job):
     title = str(job.get('title', ''))
@@ -127,7 +149,7 @@ def assess(job):
     if age <= 7: score += 1
     employer = job.get('hiringOrganization', {}).get('name', 'Компания не указана')
     salary = job.get('baseSalary')
-    salary_text = 'не указана'
+    salary_text = job.get('_salary_text') or 'не указана'
     if isinstance(salary, dict):
         value = salary.get('value', {})
         if isinstance(value, dict):
@@ -135,8 +157,9 @@ def assess(job):
             if not bounds and value.get('value') is not None: bounds = [str(value['value'])]
             if bounds: salary_text = '–'.join(bounds) + ' ' + str(salary.get('currency', '')) + '; налоги не уточнены'
     return dict(title=title, employer=employer, url=job['url'], date=str(date)[:10], age=age,
+                date_source=job.get('_date_source','дата из метаданных; значение не установлено'),
                 address=address or 'не опубликован', location=location_status,
-                format='гибрид' if hybrid else 'удалённо' if remote else 'формат уточнить',
+                format='гибрид' if hybrid else 'удалённо' if remote else job.get('_format','формат уточнить'),
                 salary=salary_text, sector=sector, skills=skills, score=score, gaps=gaps)
 
 def telegram(method, payload):
@@ -163,6 +186,12 @@ def collect():
     from playwright.sync_api import sync_playwright
     errors, found = [], {}
     sources = json.loads((ROOT / 'sources.json').read_text())
+    extra = [
+      ('robota.ua — аналитика продаж','https://robota.ua/zapros/analityk-prodazhiv/kyiv'),
+      ('robota.ua — Data Analyst','https://robota.ua/zapros/data-analyst/kyiv'),
+      ('robota.ua — консолидированная информация','https://robota.ua/zapros/analityk-konsolidovanoyi-informatsiyi/kyiv')]
+    for name,url in extra:
+        if not any(s['url'] == url for s in sources): sources.append({'name':name,'url':url,'selector':"a[href*='/vacancy']"})
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context(locale='uk-UA')
@@ -173,6 +202,9 @@ def collect():
                 if response and response.status >= 400: raise RuntimeError('HTTP '+str(response.status))
                 try: page.wait_for_selector(source['selector'], timeout=12000)
                 except Exception: pass
+                if 'robota.ua' in source['url']:
+                    try: page.wait_for_function("document.querySelectorAll(\"a[href*='/vacancy']\").length >= 15", timeout=15000)
+                    except Exception: pass
                 links = page.locator(source['selector']).evaluate_all('(els) => els.map(e => e.href)')
                 links = list(dict.fromkeys(links))[:25]
                 if not links: raise RuntimeError('Нет доступных ссылок')
@@ -191,12 +223,6 @@ def collect():
                         try: page.wait_for_selector('script[type="application/ld+json"]', state='attached', timeout=5000)
                         except Exception: pass
                         scripts = page.locator('script[type="application/ld+json"]').all_text_contents()
-                        if link_index < 2:
-                            print('DIAGNOSTIC URL:', url)
-                            print('DIAGNOSTIC TITLE:', page.title())
-                            print('DIAGNOSTIC H1:', page.locator('h1').all_text_contents())
-                            print('DIAGNOSTIC JSON-LD:', len(scripts))
-                            print('DIAGNOSTIC TEXT:', page.locator('body').inner_text()[:5000])
                         page_jobs = []
                         for script in scripts:
                             try: data = json.loads(script)
@@ -220,7 +246,15 @@ def collect():
                 status = str(error) if isinstance(error, RuntimeError) else type(error).__name__
                 errors.append(source['name'] + ': сбор недоступен; '+status)
         browser.close()
-    return list(found.values()), errors
+    from sources_extra import collect_extra
+    more, notes = collect_extra(assess)
+    for job in more:found.setdefault(job['url'],job)
+    errors.extend(notes)
+    unique={}
+    for job in found.values():
+        key=(job['employer'].lower().strip(),job['title'].lower().strip())
+        unique.setdefault(key,job)
+    return list(unique.values()), errors
 
 def report(jobs, errors, seen):
     today = dt.datetime.now(ZoneInfo('Europe/Kyiv')).date().isoformat()
@@ -237,7 +271,7 @@ def report(jobs, errors, seen):
         label = 'повтор из предыдущих отправок' if j['url'] in seen else 'впервые в отправках этого бота'
         fit = 'высокое по правилам' if j['score'] >= 8 and not j['gaps'] else 'среднее по правилам'
         return '\n'.join([f"\n{i}. {j['employer']} — {j['title']}",
-            f"{j['date']} · {label} · отрасль: {j['sector']}",
+            f"{j['date']} ({j.get('date_source','дата сайта')}) · {label} · отрасль: {j['sector']}",
             f"{j['format']} · {j['address']} · {j['location']}",
             'Зарплата: '+j['salary'],
             '; '.join(k+': '+v for k,v in j['skills'].items()),
@@ -248,8 +282,8 @@ def report(jobs, errors, seen):
         lines.append('\nЛОКАЦИЯ ТРЕБУЕТ УТОЧНЕНИЯ — вне основного топа')
         for i,j in enumerate(pending[:5],1): lines.append(card(j,i))
     if selected: lines.append('\nПроверить в первую очередь: '+', '.join(j['employer'] for j in selected[:3]))
-    lines.append('\nTelegram-каналы, Djinni, Jooble и сайты работодателей: в этой версии не подключены. Национальность компании, метро и время в пути автоматически не подтверждаются.')
-    if errors: lines.append('\nПроблемы источников:\n'+'\n'.join(errors))
+    lines.append('\nПроверяются: robota.ua, Work.ua, DOU, Happy Monday, Jooble (с проверкой первоисточника). Telegram-каналы и Djinni пока не подключены. Национальность компании, метро и время в пути автоматически не подтверждаются.')
+    if errors: lines.append('\nСтатус источников (при ошибках поиск неполный):\n'+'\n'.join(errors))
     return '\n'.join(lines), selected + pending[:5]
 
 def main():
