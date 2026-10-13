@@ -1,0 +1,73 @@
+name: Analyst jobs to Telegram
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test = проверка Telegram; digest = поиск; dry-run = поиск без отправки'
+        type: choice
+        options: [test, digest, dry-run]
+        default: test
+  schedule:
+    - cron: '1 6 * * *'
+    - cron: '1 7 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Kyiv schedule
+        id: clock
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          python - <<'PY'
+          import datetime, os
+          from zoneinfo import ZoneInfo
+          offset = datetime.datetime.now(ZoneInfo('Europe/Kyiv')).utcoffset().total_seconds()/3600
+          expected = '1 6 * * *' if offset == 3 else '1 7 * * *'
+          run = os.environ['EVENT'] != 'schedule' or os.environ['SCHEDULE'] == expected
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('run='+str(run).lower()+'\n')
+          PY
+      - name: Restore sent vacancy history
+        if: steps.clock.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: seen-${{ github.run_id }}
+          restore-keys: seen-
+      - name: Install dependencies
+        if: steps.clock.outputs.run == 'true'
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Run bot
+        if: steps.clock.outputs.run == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "test" ]; then
+            python bot.py --test-message
+          elif [ "$MODE" = "dry-run" ]; then
+            python bot.py --dry-run
+          else
+            python bot.py
+          fi
+      - name: Save sent vacancy history
+        if: success() && steps.clock.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: seen-${{ github.run_id }}
